@@ -1,178 +1,233 @@
 import simpy
 import numpy as np
+from scipy.stats import expon, uniform
 import pandas as pd
-from scipy.stats import expon
 import matplotlib.pyplot as plt
 
-# Dados para a simulação
-TEMPO_DE_SIMULACAO = 100
-QUANTIDADE_DE_CABINES = 1  # Quantidade de cabines de pedágio
+# Listas para registrar os tempos e dados de interesse
+chegadas, saidas = [], []
+in_queue_manual, in_queue_auto, in_system = [], [], []
+desistencias = 0
+veiculos_em_atendimento = 0
+fila_temporal_manual, fila_temporal_auto = [], []  # Para registrar a fila ao longo do tempo
+tempo_trabalho_manuais, tempo_trabalho_automaticas = [], []  # Tempo de trabalho dos servidores
 
-# Parâmetros de distribuição
-MEDIA_DE_CHEGADA_DE_VEICULOS = 2  # Média de chegada dos veículos
 
-# Tempos médios de pagamento e desvios padrão por tipo de veículo
-TEMPOS_DE_PAGAMENTO = {
-    'moto': {'media': 0.5, 'desvio': 0.1},
-    'carro': {'media': 1.5, 'desvio': 0.3},
-    'caminhao': {'media': 3.0, 'desvio': 0.5}
-}
+def registrar_estado_filas(env):
+    """Registra o número de carros nas filas manual e automática ao longo do tempo."""
+    while True:
+        fila_temporal_manual.append((env.now, len(cabines_manuais.queue)))
+        fila_temporal_auto.append((env.now, len(cabines_automaticas.queue)))
+        yield env.timeout(1)  # Atualiza a cada 1 segundo
 
-# Lista de tipos de veículos e suas probabilidades
-TIPOS_DE_VEICULOS = ['moto', 'carro', 'caminhao']
-PROBABILIDADES_TIPOS = [0.3, 0.5, 0.2]
 
-# Listas para armazenar as informações da simulação
-chegadas, saidas, tipos = [], [], []
-in_queue, in_system = [], []
-horarios_nas_filas, tamanho_da_fila = [], []
+# Parâmetros gerais
+TEMPO_DE_SIMULACAO = 3600
+TRAFEGO_INTENSO = 1200 / 3600  # Chegada de veiculos por segundo
+TRAFEGO_MODERADO = 600 / 3600
+TRAFEGO_LEVE = 300 / 3600
+CHANCE_AUTOMATICO = 0.1
+CHANCE_DESISTENCIA = 0.02
 
-# Funções de distribuição
-def distribuicao_chegada_de_veiculos():
-    tempo_do_proximo_veiculo = expon.rvs(scale=MEDIA_DE_CHEGADA_DE_VEICULOS, size=1)
-    return tempo_do_proximo_veiculo[0]
+# Configurações de cabines
+CABINES_MANUAIS = 3
+CABINES_AUTOMATICAS = 1
+TEMPO_MANUAL_MIN = 10
+TEMPO_MANUAL_MAX = 30
+TEMPO_AUTOMATICO_MIN = 5
+TEMPO_AUTOMATICO_MAX = 10
 
-def tempo_de_pagamento_veiculo(tipo):
-    parametros = TEMPOS_DE_PAGAMENTO[tipo]
-    return max(0, np.random.normal(parametros['media'], parametros['desvio']))
 
-# Função para salvar o tempo na fila
-def salva_info_da_fila(env, pedagio):
-    horario_medicao = env.now
-    tamanho_da_fila_agora = len(pedagio.queue)
-    horarios_nas_filas.append(horario_medicao)
-    tamanho_da_fila.append(tamanho_da_fila_agora)
-    return horario_medicao
+def distribuicao_chegada(taxa_chegada):
+    """Gera o tempo de chegada entre veículos usando distribuição exponencial."""
+    return expon.rvs(scale=1 / taxa_chegada)
 
-# Função que define o tempo no sistema
+
+def tempo_manual():
+    """Tempo para passar por uma cabine manual (uniforme)."""
+    return uniform.rvs(loc=TEMPO_MANUAL_MIN, scale=(TEMPO_MANUAL_MAX - TEMPO_MANUAL_MIN))
+
+
+def tempo_automatico():
+    """Tempo para passar por uma cabine automática (uniforme)."""
+    return uniform.rvs(loc=TEMPO_AUTOMATICO_MIN, scale=(TEMPO_AUTOMATICO_MAX - TEMPO_AUTOMATICO_MIN))
+
+
 def calcula_tempo_no_sistema(env, horario_chegada):
+    """Registra o tempo total no sistema."""
     horario_saida = env.now
     saidas.append(horario_saida)
     tempo_total = horario_saida - horario_chegada
     in_system.append(tempo_total)
 
-# Função que simula a chegada dos veículos
-def chegada_dos_veiculos(env, cabines_de_pedagio):
+
+def atendimento_manual(env, veiculo_id, horario_chegada):
+    global desistencias, veiculos_em_atendimento
+
+    veiculos_em_atendimento += 1
+
+    with cabines_manuais.request() as req:
+        if np.random.rand() < CHANCE_DESISTENCIA:
+            desistencias += 1
+            veiculos_em_atendimento -= 1
+            print(f"Veículo {veiculo_id} desistiu na fila manual em {env.now:.2f}s")
+            return
+
+        yield req
+        inicio_atendimento = env.now
+        yield env.timeout(tempo_manual())
+        fim_atendimento = env.now
+
+        # Registro do tempo de trabalho da cabine manual
+        tempo_trabalho_manuais.append((inicio_atendimento, fim_atendimento))
+
+        tempo_na_fila = inicio_atendimento - horario_chegada
+        in_queue_manual.append(tempo_na_fila)
+
+        print(f"Veículo {veiculo_id} atendido na cabine manual em {env.now:.2f}s")
+        calcula_tempo_no_sistema(env, horario_chegada)
+
+    veiculos_em_atendimento -= 1
+
+
+def atendimento_automatico(env, veiculo_id, horario_chegada):
+    global veiculos_em_atendimento, desistencias
+
+    veiculos_em_atendimento += 1
+
+    with cabines_automaticas.request() as req:
+        if np.random.rand() < CHANCE_DESISTENCIA:
+            desistencias += 1
+            veiculos_em_atendimento -= 1
+            print(f"Veículo {veiculo_id} desistiu na fila automática em {env.now:.2f}s")
+            return
+
+        yield req
+        inicio_atendimento = env.now
+        yield env.timeout(tempo_automatico())
+        fim_atendimento = env.now
+
+        # Registro do tempo de trabalho da cabine automática
+        tempo_trabalho_automaticas.append((inicio_atendimento, fim_atendimento))
+
+        tempo_na_fila = inicio_atendimento - horario_chegada
+        in_queue_auto.append(tempo_na_fila)
+
+        print(f"Veículo {veiculo_id} atendido na cabine automática em {env.now:.2f}s")
+        calcula_tempo_no_sistema(env, horario_chegada)
+
+    veiculos_em_atendimento -= 1
+
+
+def chegada_de_veiculos(env, taxa_chegada):
+    """Gera veiculos que chegam ao pedágio."""
     veiculo_id = 0
 
     while True:
-        tempo_do_proximo_veiculo = distribuicao_chegada_de_veiculos()
-        yield env.timeout(tempo_do_proximo_veiculo)
-
-        tempo_de_chegada = env.now
-        tipo_veiculo = np.random.choice(TIPOS_DE_VEICULOS, p=PROBABILIDADES_TIPOS)
-        tipos.append(tipo_veiculo)
-
-        chegadas.append(tempo_de_chegada)
+        yield env.timeout(distribuicao_chegada(taxa_chegada))
         veiculo_id += 1
-        print(f'Veículo {veiculo_id} ({tipo_veiculo}) chegou ao pedágio em {tempo_de_chegada:.2f}')
+        horario_chegada = env.now
+        chegadas.append(horario_chegada)
 
-        env.process(pagamento(env, veiculo_id, tempo_de_chegada, tipo_veiculo, cabines_de_pedagio))
+        print(f"Veículo {veiculo_id} chegou ao pedágio em {horario_chegada:.2f}s")
 
-# Função que simula o pagamento do pedágio
-def pagamento(env, veiculo_id, horario_chegada, tipo_veiculo, cabines_de_pedagio):
-    with cabines_de_pedagio.request() as req:
-        print(f'Veículo {veiculo_id} ({tipo_veiculo}) entrou na fila em {env.now:.2f}')
-        horario_entrada_da_fila = salva_info_da_fila(env, cabines_de_pedagio)
-        yield req  # Espera pela cabine de pedágio
+        # Decide se o veiculo vai para cabine automática ou manual
+        if np.random.rand() < CHANCE_AUTOMATICO:
+            env.process(atendimento_automatico(env, veiculo_id, horario_chegada))
+        else:
+            env.process(atendimento_manual(env, veiculo_id, horario_chegada))
 
-        print(f'Veículo {veiculo_id} ({tipo_veiculo}) saiu da fila em {env.now:.2f}')
-        horario_saida_da_fila = salva_info_da_fila(env, cabines_de_pedagio)
 
-        tempo_na_fila = horario_saida_da_fila - horario_entrada_da_fila
-        in_queue.append(tempo_na_fila)
+# Configuração inicial
+np.random.seed()  # Seed para reprodutibilidade
 
-        # Execução do pagamento
-        tempo_pagamento = tempo_de_pagamento_veiculo(tipo_veiculo)
-        yield env.timeout(tempo_pagamento)
-        print(f'Veículo {veiculo_id} ({tipo_veiculo}) pagou o pedágio em {tempo_pagamento:.2f} minutos')
+# Configurações do ambiente
+env = simpy.Environment()
+cabines_manuais = simpy.Resource(env, capacity=CABINES_MANUAIS)
+cabines_automaticas = simpy.Resource(env, capacity=CABINES_AUTOMATICAS)
 
-        calcula_tempo_no_sistema(env, horario_chegada)
+# Definir o tráfego: escolha intenso, moderado ou leve
+TAXA_CHEGADA = TRAFEGO_MODERADO  # Alterar para TRAFEGO_INTENOS, TRAFEGO_MODERADO ou TRAFEGO_LEVE conforme necessário
 
-# Função para calcular a média do tamanho da fila
-def media_fila(df_tamanho_fila):
-    df_tamanho_fila['delta'] = df_tamanho_fila['horario'].shift(-1) - df_tamanho_fila['horario']
-    df_tamanho_fila = df_tamanho_fila[0:-1]  # Remove última linha que tem delta infinito
-    return np.average(df_tamanho_fila['tamanho'], weights=df_tamanho_fila['delta'])
+# Iniciar processos
+env.process(chegada_de_veiculos(env, TAXA_CHEGADA))
+env.process(registrar_estado_filas(env))
 
-# Função para calcular a utilização do serviço
-def utilizacao_servico(df_tamanho_fila):
-    soma_servico_livre = df_tamanho_fila[df_tamanho_fila['tamanho'] == 0]['delta'].sum()
-    primeiro_evento = df_tamanho_fila['horario'].iloc[0]
-    soma_servico_livre += primeiro_evento
-    return round((1 - soma_servico_livre / TEMPO_DE_SIMULACAO) * 100, 2)
+# Rodar simulação
+env.run(until=TEMPO_DE_SIMULACAO)
 
-# Função para calcular a porcentagem de veículos que não esperaram na fila
-def porcentagem_de_nao_esperaram(df_tamanho_fila):
-    soma_nao_esperaram = df_tamanho_fila[df_tamanho_fila['tamanho'] >= 1]['delta'].sum()
-    return round((soma_nao_esperaram / TEMPO_DE_SIMULACAO) * 100, 2)
+# Estatísticas finais
+print("\nResultados da Simulação:")
+print(f"Total de veículos que chegaram: {len(chegadas)}")
+print(f"Total de desistências: {desistencias}")
+print(f"Tempo médio na fila manual: {np.mean(in_queue_manual):.2f}s")
+print(f"Tempo médio na fila automática: {np.mean(in_queue_auto):.2f}s")
+print(f"Tempo médio total no sistema: {np.mean(in_system):.2f}s")
 
-# Função para rodar a simulação
-def rodar_simulacao():
-    np.random.seed(1)
+# Garantir que ambas as listas tenham o mesmo tamanho para não dar erro
+max_len = max(len(chegadas), len(saidas))
 
-    # Prepara o ambiente
-    env = simpy.Environment()
+# Preencher com NaN para igualar os comprimentos
+chegadas = chegadas + [float('nan')] * (max_len - len(chegadas))
+saidas = saidas + [float('nan')] * (max_len - len(saidas))
 
-    # Definindo recursos (quantidade de cabines de pedágio)
-    cabines_de_pedagio = simpy.Resource(env, capacity=QUANTIDADE_DE_CABINES)
+# Criar DataFrame para organizar os dados
+df_entrada_saida = pd.DataFrame({
+    'chegadas': chegadas,
+    'saidas': saidas
+})
 
-    # Inicializa a chegada de veículos
-    env.process(chegada_dos_veiculos(env, cabines_de_pedagio))
+# Gráfico de pontos: Entradas e saídas
+fig, ax = plt.subplots()
+fig.set_size_inches(10, 5.4)
 
-    # Executa a simulação
-    env.run(until=TEMPO_DE_SIMULACAO)
+y1, x1 = list(range(len(df_entrada_saida['chegadas']))), df_entrada_saida['chegadas']
+y2, x2 = list(range(len(df_entrada_saida['saidas']))), df_entrada_saida['saidas']
 
-    # Criando DataFrames com os dados da simulação
-    df1 = pd.DataFrame(horarios_nas_filas, columns=['horario'])
-    df2 = pd.DataFrame(tamanho_da_fila, columns=['tamanho'])
-    df3 = pd.DataFrame(chegadas, columns=['chegadas'])
-    df4 = pd.DataFrame(saidas, columns=['partidas'])
+ax.plot(x1, y1, color='blue', marker="o", linewidth=0, label="Chegada")
+ax.plot(x2, y2, color='red', marker="o", linewidth=0, label="Saída")
 
-    df_tamanho_da_fila = pd.concat([df1, df2], axis=1)
-    df_entrada_saida = pd.concat([df3, df4], axis=1)
+ax.set_xlabel('Tempo (s)')
+ax.set_ylabel('Veículo ID')
+ax.set_title("Chegadas e Saídas no Pedágio")
+ax.legend()
+ax.grid()
 
-    # Exibindo gráficos de chegada e saída
-    fig, ax = plt.subplots()
-    fig.set_size_inches(10, 5.4)
-    x1, y1 = list(df_entrada_saida['chegadas'].keys()), df_entrada_saida['chegadas']
-    x2, y2 = list(df_entrada_saida['partidas'].keys()), df_entrada_saida['partidas']
+plt.show()
 
-    ax.plot(x1, y1, color='blue', marker="o", linewidth=0, label="Chegada")
-    ax.plot(x2, y2, color='red', marker="o", linewidth=0, label="Saída")
-    ax.set_xlabel('Tempo')
-    ax.set_ylabel('Veículo ID')
-    ax.set_title("Chegadas & Saídas no Pedágio")
-    ax.legend()
-    fig.show()
+# Gráficos de linhas: Carros na fila
+fig, ax = plt.subplots()
+fig.set_size_inches(10, 5.4)
 
-    # Exibindo gráfico de tamanho da fila
-    fig, ax = plt.subplots()
-    fig.set_size_inches(10, 5.4)
-    ax.plot(df_tamanho_da_fila['horario'], df_tamanho_da_fila['tamanho'], color='blue', linewidth=1)
-    ax.set_xlabel('Tempo')
-    ax.set_ylabel('Número de Veículos na Fila')
-    ax.set_title('Número de veículos na fila')
-    ax.grid()
-    fig.show()
+# Dados para as filas temporais
+temporal_manual, fila_manual = zip(*fila_temporal_manual)
+temporal_auto, fila_auto = zip(*fila_temporal_auto)
 
-    # Exibindo gráfico da distribuição dos tipos de veículos
-    tipos_contagem = pd.Series(tipos).value_counts()
-    fig, ax = plt.subplots()
-    fig.set_size_inches(8, 5)
-    tipos_contagem.plot(kind='bar', color=['orange', 'green', 'blue'], ax=ax)
-    ax.set_xlabel('Tipos de Veículos')
-    ax.set_ylabel('Quantidade')
-    ax.set_title('Distribuição dos Tipos de Veículos')
-    ax.grid(axis='y', linestyle='--', alpha=0.7)
-    fig.show()
+ax.plot(temporal_manual, fila_manual, label="Fila Manual", color="blue")
+ax.plot(temporal_auto, fila_auto, label="Fila Automática", color="green")
 
-    # Cálculos estatísticos
-    print('O tempo médio na fila é de %.2f' % (np.mean(in_queue)))
-    print('O tempo médio no sistema é %.2f' % (np.mean(in_system)))
-    print('O número médio de veículos na fila é %.2f' % media_fila(df_tamanho_da_fila))
-    print('A utilização do serviço é %.2f %%' % utilizacao_servico(df_tamanho_da_fila))
-    print('A probabilidade de veículos que não podem esperar na fila é %.2f' % (porcentagem_de_nao_esperaram(df_tamanho_da_fila)))
+ax.set_xlabel("Tempo (s)")
+ax.set_ylabel("Número de veículos na fila")
+ax.set_title("Número de veículos nas filas ao longo do tempo")
+ax.legend()
+plt.show()
 
-# Rodar a simulação
-rodar_simulacao()
+# Gráfico de segmentos de linha: Tempo de trabalho dos pedágios (ajustado para o texto caber na tela)
+fig, ax = plt.subplots()
+fig.set_size_inches(12, 6)
+
+for inicio, fim in tempo_trabalho_manuais:
+    ax.plot([inicio, fim], [0, 0], color="blue", linewidth=2, label="Manual" if inicio == tempo_trabalho_manuais[0][0] else "")
+for inicio, fim in tempo_trabalho_automaticas:
+    ax.plot([inicio, fim], [1, 1], color="green", linewidth=2, label="Automático" if inicio == tempo_trabalho_automaticas[0][0] else "")
+
+ax.set_xlabel("Tempo (s)")
+ax.set_xlim(0, TEMPO_DE_SIMULACAO)
+ax.set_yticks([0, 1])
+ax.set_yticklabels(["Cabines Manuais", "Cabines Automáticas"])
+ax.set_title("Tempo de Trabalho dos Servidores ao Longo do Tempo")
+
+ax.legend(loc="center left", bbox_to_anchor=(-0.1, 0.5), fontsize=10)
+
+plt.tight_layout()
+plt.show()
